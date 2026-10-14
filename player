@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""A small terminal music player backed by ffplay."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+
+AUDIO_EXTENSIONS = {
+    ".aac", ".aif", ".aiff", ".alac", ".flac", ".m4a", ".mp3",
+    ".oga", ".ogg", ".opus", ".wav", ".wma",
+}
+SEEK_SECONDS = 10
+
+
+def state_file() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return base / "player" / "last_playlist.json"
+
+
+def natural_key(path: Path, root: Path) -> list[tuple[int, object]]:
+    name = str(path.relative_to(root)).casefold()
+    return [(1, int(part)) if part.isdigit() else (0, part)
+            for part in re.split(r"(\d+)", name)]
+
+
+def songs_in(directory: Path) -> list[Path]:
+    return sorted(
+        (p for p in directory.rglob("*") if p.is_file() and p.suffix.casefold() in AUDIO_EXTENSIONS),
+        key=lambda p: natural_key(p, directory),
+    )
+
+
+def last_playlist() -> Path | None:
+    try:
+        data = json.loads(state_file().read_text(encoding="utf-8"))
+        return Path(data["directory"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def remember_playlist(directory: Path) -> None:
+    path = state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        temp.write_text(json.dumps({"directory": str(directory)}, ensure_ascii=False), encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def duration_of(path: Path) -> float | None:
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        value = float(result.stdout.strip())
+        return value if value > 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def clock(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02}:{secs:02}" if hours else f"{minutes:02}:{secs:02}"
+
+
+class Player:
+    def __init__(self, directory: Path, songs: list[Path]):
+        self.directory = directory
+        self.songs = songs
+        self.selected = 0
+        self.current = 0
+        self.process: subprocess.Popen[bytes] | None = None
+        self.position = 0.0
+        self.started_at = 0.0
+        self.paused = False
+        self.duration: float | None = None
+        self.message = ""
+        self.failed_tracks = 0
+
+    def elapsed(self) -> float:
+        if self.process is None or self.paused:
+            return self.position
+        return self.position + time.monotonic() - self.started_at
+
+    def stop(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            if self.paused:
+                process.send_signal(signal.SIGCONT)
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        self.paused = False
+
+    def play(self, index: int, offset: float = 0.0) -> None:
+        self.stop()
+        self.current = index
+        self.selected = index
+        self.duration = duration_of(self.songs[index])
+        self.position = max(0.0, offset)
+        if self.duration is not None:
+            self.position = min(self.position, max(0.0, self.duration - 0.1))
+        command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", "-nostats"]
+        if self.position:
+            command += ["-ss", str(self.position)]
+        command += ["-i", str(self.songs[index])]
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+            self.started_at = time.monotonic()
+            self.message = ""
+        except OSError as error:
+            self.message = f"Ошибка воспроизведения: {error}"
+
+    def next(self) -> None:
+        self.play((self.current + 1) % len(self.songs))
+
+    def previous(self) -> None:
+        self.play((self.current - 1) % len(self.songs))
+
+    def seek(self, seconds: int) -> None:
+        target = max(0.0, self.elapsed() + seconds)
+        if self.duration is not None and target >= self.duration:
+            self.next()
+            return
+        was_paused = self.paused
+        self.play(self.current, target)
+        if was_paused:
+            self.toggle_pause()
+
+    def toggle_pause(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        if self.paused:
+            self.process.send_signal(signal.SIGCONT)
+            self.started_at = time.monotonic()
+            self.paused = False
+        else:
+            self.position = self.elapsed()
+            self.process.send_signal(signal.SIGSTOP)
+            self.paused = True
+
+    def tick(self) -> None:
+        if self.process is not None and self.process.poll() is not None:
+            exit_code = self.process.wait()
+            self.process = None
+            self.paused = False
+            if exit_code:
+                self.failed_tracks += 1
+                if self.failed_tracks >= len(self.songs):
+                    self.message = "Не удалось воспроизвести файлы в этой папке"
+                    return
+            else:
+                self.failed_tracks = 0
+            self.next()
+
+
+def draw_line(screen: curses.window, row: int, value: str, width: int,
+              attributes: int = 0) -> None:
+    if row < 0 or width < 2:
+        return
+    try:
+        screen.addnstr(row, 0, value, width - 1, attributes)
+    except curses.error:
+        pass
+
+
+def render(screen: curses.window, player: Player) -> None:
+    screen.erase()
+    height, width = screen.getmaxyx()
+    if height < 10 or width < 28:
+        draw_line(screen, 0, "Увеличьте окно терминала", width)
+        screen.refresh()
+        return
+
+    title = player.songs[player.current].relative_to(player.directory).as_posix()
+    status = "ПАУЗА" if player.paused else "ИГРАЕТ" if player.process else "ОШИБКА"
+    draw_line(screen, 0, f"  player  /  {player.directory}", width, curses.A_BOLD)
+    draw_line(screen, 2, f"  {status}  {title}", width)
+    elapsed = player.elapsed()
+    draw_line(screen, 3, f"  {clock(elapsed)} / {clock(player.duration)}", width)
+    bar_width = max(0, width - 4)
+    fraction = min(1.0, elapsed / player.duration) if player.duration else 0.0
+    draw_line(screen, 4, "  " + "━" * int(bar_width * fraction) + "─" * (bar_width - int(bar_width * fraction)), width)
+
+    available = height - 9
+    first = max(0, min(player.selected - available // 2, len(player.songs) - available))
+    for row, index in enumerate(range(first, min(len(player.songs), first + available)), start=6):
+        marker = "▶" if index == player.current else " "
+        name = player.songs[index].relative_to(player.directory).as_posix()
+        line = f" {marker} {index + 1:>3}  {name}"
+        draw_line(screen, row, line, width, curses.A_REVERSE if index == player.selected else 0)
+
+    draw_line(screen, height - 2,
+              "  ↑↓ выбор  Enter играть  ←→ ±10с  Space пауза  n/p трек  q выход", width)
+    if player.message:
+        draw_line(screen, height - 1, "  " + player.message, width)
+    screen.refresh()
+
+
+def interface(screen: curses.window, player: Player) -> None:
+    curses.curs_set(0)
+    screen.keypad(True)
+    screen.timeout(100)
+    player.play(0)
+    try:
+        while True:
+            player.tick()
+            render(screen, player)
+            key = screen.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (curses.KEY_UP, ord("k")):
+                player.selected = max(0, player.selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                player.selected = min(len(player.songs) - 1, player.selected + 1)
+            elif key in (10, 13, curses.KEY_ENTER):
+                player.play(player.selected)
+            elif key == curses.KEY_RIGHT:
+                player.seek(SEEK_SECONDS)
+            elif key == curses.KEY_LEFT:
+                player.seek(-SEEK_SECONDS)
+            elif key == ord(" "):
+                player.toggle_pause()
+            elif key == ord("n"):
+                player.next()
+            elif key == ord("p"):
+                player.previous()
+    finally:
+        player.stop()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Минималистичный музыкальный плеер в терминале")
+    parser.add_argument("directory", nargs="?", help="папка с музыкой; без аргумента — последняя папка")
+    args = parser.parse_args()
+
+    if not shutil.which("ffplay"):
+        parser.error("не найден ffplay; установите FFmpeg")
+    directory = Path(args.directory).expanduser().resolve() if args.directory else last_playlist()
+    if directory is None:
+        parser.error("нет последнего плейлиста; запустите player <папка>")
+    if not directory.is_dir():
+        parser.error(f"папка не найдена: {directory}")
+    songs = songs_in(directory)
+    if not songs:
+        parser.error(f"в папке нет аудиофайлов: {directory}")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        parser.error("нужен интерактивный терминал")
+
+    try:
+        remember_playlist(directory)
+    except OSError as error:
+        print(f"player: не удалось сохранить последний плейлист: {error}", file=sys.stderr)
+    try:
+        curses.wrapper(interface, Player(directory, songs))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
