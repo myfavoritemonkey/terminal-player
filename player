@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import curses
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -84,10 +86,32 @@ def clock(seconds: float | None) -> str:
     return f"{hours}:{minutes:02}:{secs:02}" if hours else f"{minutes:02}:{secs:02}"
 
 
+@dataclass(frozen=True)
+class PlaylistRow:
+    path: Path
+    depth: int
+    song_index: int | None = None
+
+
 class Player:
     def __init__(self, directory: Path, songs: list[Path]):
         self.directory = directory
         self.songs = songs
+        self.children: dict[Path, list[Path]] = defaultdict(list)
+        self.song_indices = {path: index for index, path in enumerate(songs)}
+        folders: set[Path] = set()
+        for song in songs:
+            folder = song.parent
+            while folder != directory:
+                folders.add(folder)
+                folder = folder.parent
+            self.children[song.parent].append(song)
+        for folder in folders:
+            self.children[folder.parent].append(folder)
+        for parent, children in self.children.items():
+            children.sort(key=lambda path: natural_key(path, parent))
+        self.expanded = set(folders)
+        self.rows = self.visible_rows()
         self.selected = 0
         self.current = 0
         self.process: subprocess.Popen[bytes] | None = None
@@ -97,6 +121,42 @@ class Player:
         self.duration: float | None = None
         self.message = ""
         self.failed_tracks = 0
+
+    def visible_rows(self) -> list[PlaylistRow]:
+        rows: list[PlaylistRow] = []
+
+        def visit(folder: Path, depth: int) -> None:
+            for path in self.children.get(folder, []):
+                if path in self.song_indices:
+                    rows.append(PlaylistRow(path, depth, self.song_indices[path]))
+                else:
+                    rows.append(PlaylistRow(path, depth))
+                    if path in self.expanded:
+                        visit(path, depth + 1)
+
+        visit(self.directory, 0)
+        return rows
+
+    def select_current(self) -> None:
+        for index, row in enumerate(self.rows):
+            if row.song_index == self.current:
+                self.selected = index
+                return
+        for index, row in enumerate(self.rows):
+            if row.song_index is None and self.songs[self.current].is_relative_to(row.path):
+                self.selected = index
+
+    def activate_selected(self) -> None:
+        row = self.rows[self.selected]
+        if row.song_index is not None:
+            self.play(row.song_index)
+            return
+        if row.path in self.expanded:
+            self.expanded.remove(row.path)
+        else:
+            self.expanded.add(row.path)
+        self.rows = self.visible_rows()
+        self.selected = next(index for index, item in enumerate(self.rows) if item.path == row.path)
 
     def elapsed(self) -> float:
         if self.process is None or self.paused:
@@ -122,7 +182,7 @@ class Player:
     def play(self, index: int, offset: float = 0.0) -> None:
         self.stop()
         self.current = index
-        self.selected = index
+        self.select_current()
         self.duration = duration_of(self.songs[index])
         self.position = max(0.0, offset)
         if self.duration is not None:
@@ -212,15 +272,22 @@ def render(screen: curses.window, player: Player) -> None:
     draw_line(screen, 4, "  " + "━" * int(bar_width * fraction) + "─" * (bar_width - int(bar_width * fraction)), width)
 
     available = height - 9
-    first = max(0, min(player.selected - available // 2, len(player.songs) - available))
-    for row, index in enumerate(range(first, min(len(player.songs), first + available)), start=6):
-        marker = "▶" if index == player.current else " "
-        name = player.songs[index].relative_to(player.directory).as_posix()
-        line = f" {marker} {index + 1:>3}  {name}"
-        draw_line(screen, row, line, width, curses.A_REVERSE if index == player.selected else 0)
+    first = max(0, min(player.selected - available // 2, len(player.rows) - available))
+    for screen_row, index in enumerate(range(first, min(len(player.rows), first + available)), start=6):
+        item = player.rows[index]
+        if item.song_index is None:
+            playing_inside = item.path not in player.expanded and player.songs[player.current].is_relative_to(item.path)
+            marker = "▶" if playing_inside else " "
+            icon = "▾" if item.path in player.expanded else "▸"
+            label = f"{icon} {item.path.name}/"
+        else:
+            marker = "▶" if item.song_index == player.current else " "
+            label = f"{item.song_index + 1:>3}  {item.path.name}"
+        line = f" {marker} {'  ' * item.depth}{label}"
+        draw_line(screen, screen_row, line, width, curses.A_REVERSE if index == player.selected else 0)
 
     draw_line(screen, height - 2,
-              "  ↑↓ выбор  Enter играть  ←→ ±10с  Space пауза  n/p трек  q выход", width)
+              "  ↑↓ выбор  Enter играть/папка  ←→ ±10с  Space пауза  n/p трек  q выход", width)
     if player.message:
         draw_line(screen, height - 1, "  " + player.message, width)
     screen.refresh()
@@ -241,9 +308,9 @@ def interface(screen: curses.window, player: Player) -> None:
             if key in (curses.KEY_UP, ord("k")):
                 player.selected = max(0, player.selected - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
-                player.selected = min(len(player.songs) - 1, player.selected + 1)
+                player.selected = min(len(player.rows) - 1, player.selected + 1)
             elif key in (10, 13, curses.KEY_ENTER):
-                player.play(player.selected)
+                player.activate_selected()
             elif key == curses.KEY_RIGHT:
                 player.seek(SEEK_SECONDS)
             elif key == curses.KEY_LEFT:

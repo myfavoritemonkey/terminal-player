@@ -10,6 +10,7 @@ from unittest.mock import patch
 module = runpy.run_path(str(Path(__file__).with_name("player")))
 Player = module["Player"]
 songs_in = module["songs_in"]
+render = module["render"]
 last_playlist = module["last_playlist"]
 remember_playlist = module["remember_playlist"]
 
@@ -30,6 +31,23 @@ class FakeProcess:
 
     def wait(self, timeout=None):
         return self.exit_code
+
+
+class FakeScreen:
+    def __init__(self):
+        self.lines = {}
+
+    def erase(self):
+        self.lines.clear()
+
+    def getmaxyx(self):
+        return 20, 80
+
+    def addnstr(self, row, column, value, width, attributes):
+        self.lines[row] = value[:width]
+
+    def refresh(self):
+        pass
 
 
 class PlayerTests(unittest.TestCase):
@@ -76,6 +94,46 @@ class PlayerTests(unittest.TestCase):
                 player.tick()
                 self.assertEqual(player.current, 1)
                 player.stop()
+
+    def test_nested_folders_can_collapse_without_changing_playback_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ["Album/Disc 2/track10.mp3", "Album/Disc 2/track2.mp3",
+                         "Album/Disc 1/track1.mp3", "other.ogg"]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            player = Player(root, songs_in(root))
+            self.assertEqual([row.path.name for row in player.rows],
+                             ["Album", "Disc 1", "track1.mp3", "Disc 2",
+                              "track2.mp3", "track10.mp3", "other.ogg"])
+            screen = FakeScreen()
+            render(screen, player)
+            self.assertTrue(any("▾ Album/" in line for line in screen.lines.values()))
+
+            disc = root / "Album" / "Disc 2"
+            player.selected = next(i for i, row in enumerate(player.rows) if row.path == disc)
+            player.activate_selected()
+            self.assertEqual([row.path.name for row in player.rows],
+                             ["Album", "Disc 1", "track1.mp3", "Disc 2", "other.ogg"])
+            self.assertEqual(player.rows[player.selected].path, disc)
+            render(screen, player)
+            self.assertTrue(any("▸ Disc 2/" in line for line in screen.lines.values()))
+            self.assertEqual([song.name for song in player.songs],
+                             ["track1.mp3", "track2.mp3", "track10.mp3", "other.ogg"])
+
+            with patch.dict(Player.play.__globals__, {"duration_of": lambda path: None}), \
+                 patch("subprocess.Popen", return_value=FakeProcess()):
+                player.play(1)
+                self.assertEqual(player.rows[player.selected].path, disc)
+                player.next()
+                self.assertEqual(player.current, 2)
+                self.assertEqual(player.rows[player.selected].path, disc)
+                player.stop()
+
+            player.activate_selected()
+            self.assertEqual(player.rows[player.selected].path, disc)
+            self.assertIn("track2.mp3", [row.path.name for row in player.rows])
 
 
 if __name__ == "__main__":
