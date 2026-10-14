@@ -1,6 +1,7 @@
 """Small behavior checks that do not require an audio device."""
 
 from pathlib import Path
+import curses
 import runpy
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ module = runpy.run_path(str(Path(__file__).with_name("player")))
 Player = module["Player"]
 songs_in = module["songs_in"]
 render = module["render"]
+configure_folder_colors = module["configure_folder_colors"]
 last_playlist = module["last_playlist"]
 remember_playlist = module["remember_playlist"]
 
@@ -36,15 +38,18 @@ class FakeProcess:
 class FakeScreen:
     def __init__(self):
         self.lines = {}
+        self.attributes = {}
 
     def erase(self):
         self.lines.clear()
+        self.attributes.clear()
 
     def getmaxyx(self):
         return 20, 80
 
     def addnstr(self, row, column, value, width, attributes):
         self.lines[row] = value[:width]
+        self.attributes[row] = attributes
 
     def refresh(self):
         pass
@@ -134,6 +139,34 @@ class PlayerTests(unittest.TestCase):
             player.activate_selected()
             self.assertEqual(player.rows[player.selected].path, disc)
             self.assertIn("track2.mp3", [row.path.name for row in player.rows])
+
+    def test_muted_colors_group_tracks_by_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ["Album 1/song.mp3", "Album 2/song.mp3"]:
+                path = root / name
+                path.parent.mkdir(parents=True)
+                path.touch()
+            player = Player(root, songs_in(root))
+            with patch.object(curses, "has_colors", return_value=True), \
+                 patch.object(curses, "start_color"), \
+                 patch.object(curses, "use_default_colors"), \
+                 patch.object(curses, "init_pair"), \
+                 patch.object(curses, "color_pair", side_effect=lambda pair: pair << 8), \
+                 patch.object(curses, "COLORS", 256, create=True), \
+                 patch.object(curses, "COLOR_PAIRS", 32, create=True):
+                configure_folder_colors(player)
+            first = player.folder_styles[root / "Album 1"]
+            second = player.folder_styles[root / "Album 2"]
+            self.assertNotEqual(first, second)
+            screen = FakeScreen()
+            render(screen, player)
+            for folder, style in [("Album 1", first), ("Album 2", second)]:
+                folder_row = next(row for row, line in screen.lines.items()
+                                  if f"▾ {folder}/" in line)
+                song_row = folder_row + 1
+                self.assertEqual(screen.attributes[folder_row] & ~curses.A_REVERSE, style)
+                self.assertEqual(screen.attributes[song_row], style)
 
 
 if __name__ == "__main__":
